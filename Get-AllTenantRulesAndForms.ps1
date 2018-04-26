@@ -2,7 +2,7 @@
 # Get-AllTenantRulesAndForms.ps1
 # 
 # Dumps all Rules and custom forms from all mailboxes in an Office 365 tenancy
-# Script requires user with Discovery Management admin role assignment (which is better than impersonation): https://technet.microsoft.com/en-us/library/dd351080(v=exchg.150).aspx
+# Script requires user with Global Admin role assignment (which is better than impersonation)
 #
 ######################################### 
 
@@ -37,18 +37,57 @@ function Get-ExtendedProperty
     }
 }
 
-function Convert-ByteArrays ($bytearray)
+function Check-Action($bytearray, [REF] $isPotentiallyMalicious, [REF] $actionType, [REF] $actionCommand)
 {
-    foreach ($byte in $bytearray) 
+
+
+    $isPotentiallyMalicious.Value = $false
+    $actionType.Value = ""
+    $actionCommand.Value = ""
+
+
+    if ($bytearray.Length -gt 30 )
     {
-        if ($byte -gt 31 -and $byte -lt 127)
+      if ($bytearray[2] -eq 1 -and $bytearray[14] -eq 5 )
+      {
+        if ($bytearray[29] -eq 0x14) 
         {
-            $returnstring += [char]$byte
+         $actionType.Value = "ID_ACTION_CUSTOM"
+         $isPotentiallyMalicious.Value = $true
+
+        } 
+        elseif ($bytearray[29] -eq 0x1e) 
+        {
+         $actionType.Value = "ID_ACTION_EXECUTE"
+         $isPotentiallyMalicious.Value = $true
+
         }
+         elseif ($bytearray[29] -eq 0x20) 
+        {
+         $actionType.Value = "ID_ACTION_RUN_MACRO"
+         $isPotentiallyMalicious.Value = $true
+        }
+      }
+      
+      if ($isPotentiallyMalicious.Value -eq $true)
+      {
+        foreach ($byte in $bytearray) 
+        {
+            if ($byte -gt 31 -and $byte -lt 127)
+            {
+                $returnstring += [char]$byte
+            }
+        }
+
+        $actionCommand.Value  = $returnstring
+      }
     }
-    return $returnstring
 }
 
+function Convert-ByteArrays ($bytearray)
+{
+    return [Convert]::ToBase64String($bytearray)
+}
 
 #Exchange Web Services requires a specific DLL be loaded in order to perform calls against it. This DLL can typically be found on a system after installing EWS Managed API here: C:\Program Files (x86)\Microsoft\Exchange\Web Services\2.1\Microsoft.Exchange.WebServices.dll
 #Exchange Web Services Assembly generated with "Out-CompressedDll" from PowerSploit located here: https://github.com/PowerShellMafia/PowerSploit/blob/dev/ScriptModification/Out-CompressedDll.ps1. The command "Out-CompressedDll -FilePath .\Microsoft.Exchange.WebServices.dll | Out-File -Encoding ASCII .\encoded.txt" was used.
@@ -79,7 +118,8 @@ $password = $adminCredential.GetNetworkCredential().Password
 
 #Then let's setup our EWS credential
 $exchService = New-Object Microsoft.Exchange.WebServices.Data.ExchangeService
-$exchService.Credentials = new-object System.Net.NetworkCredential($UserName, $password, "") 
+$exchService.Credentials = new-object System.Net.NetworkCredential($UserName, $password, "")
+$exchService.HttpHeaders.Add("X-AnchorMailbox", $UserName)
 
 #Setting up the O365 Exchange EWS Connection
 $exchService.Url = new-object System.Uri(("https://" + $hostName + "/EWS/Exchange.asmx")) 
@@ -113,12 +153,13 @@ $propertySet.Add($dateTimeCreatedProperty)
 
 #Connect to Remote Powershell
 #This gets us connected to an Exchange remote powershell service
-$ExoSession = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri https://outlook.office365.com/powershell-liveid/ -Credential $adminCredential -Authentication Basic -AllowRedirection
+$connectionUri = "https://outlook.office365.com/powershell-liveid?email=" + $adminCredential.UserName
+$ExoSession = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri $connectionUri -Credential $adminCredential -Authentication Basic -AllowRedirection
 Import-PSSession $ExoSession
 
 
 #Get all the mailboxes
-$mailBoxes = Get-Mailbox -ResultSize Unlimited | Select UserPrincipalName
+$mailBoxes = Get-Mailbox | Select UserPrincipalName
 ("Number of mailboxes to process: " + $mailBoxes.Count.ToString())
 
 #For Every Mailbox, get all the rules and dump them to a big file
@@ -128,6 +169,8 @@ foreach ($box in $mailBoxes)
 {
     Write-Host "Pulling Inbox rules and forms for: " $box.UserPrincipalName;
     $exchService.ImpersonatedUserId = New-Object Microsoft.Exchange.WebServices.Data.ImpersonatedUserId([Microsoft.Exchange.WebServices.Data.ConnectingIdType]::SmtpAddress,$box.UserPrincipalName);
+    $exchService.HttpHeaders.Remove("X-AnchorMailbox")
+    $exchService.HttpHeaders.("X-AnchorMailbox", $box.UserPrincipalName) 
 
     $itemView = New-Object Microsoft.Exchange.WebServices.Data.ItemView(100,0,[Microsoft.Exchange.WebServices.Data.OffsetBasePoint]::Beginning)
     $itemView.Traversal = [Microsoft.Exchange.WebServices.Data.ItemTraversal]::Shallow
@@ -148,11 +191,20 @@ foreach ($box in $mailBoxes)
         $readableactions = Convert-ByteArrays ($ruleactionsbytearray)
         $readableconditions = Convert-ByteArrays($ruleconditionsbytearray)
 
+        $isPotentiallyMalicious = $false
+        $actionType = ""
+        $actionCommand = ""
+        Check-Action ($ruleactionsbytearray) ([REF] $isPotentiallyMalicious) ([REF] $actionType) ([REF] $actionCommand)
+
+
         if ($Item.ItemClass -eq "IPM.Rule.Version2.Message") 
         {
         $Rules += New-Object PSObject -Property @{
             User        = $box.UserPrincipalName
             RuleName    = Get-ExtendedProperty -Item $Item -Property $PidTagRuleMessageName
+            IsPotentiallyMalicious = $isPotentiallyMalicious
+            ActionType  = $actionType
+            ActionCommand = $actionCommand
             Action      = $readableactions
             Condition   = $readableconditions
             State       = Get-ExtendedProperty -Item $Item -Property $PidTagRuleMessageState
@@ -183,3 +235,4 @@ $Rules
 
 Write-Output "[*] These are the forms we found."
 $Forms
+
